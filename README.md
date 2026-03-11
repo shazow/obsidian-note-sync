@@ -22,7 +22,7 @@ Sync a single note with a GitHub issue using the GitHub API. If a note has a `sy
 
 ## Development
 
-- Optional environment: `nix develop` drops you into a shell with Node, npm, Git, and the GitHub CLI.
+- Optional environment: `devenv shell` (or `nix develop`) drops you into a shell with Node, npm, Git, and the GitHub CLI via `devenv`.
 - Install dependencies: `npm install` (automatically handled by `make` targets).
 - Watch mode: `npm run dev` or `make dev`
 - Production build: `npm run build` or simply `make`
