@@ -2,27 +2,20 @@
   description = "Development shell for obsidian-note-sync";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    devenv.url = "github:cachix/devenv";
   };
 
-  outputs = { self, nixpkgs, flake-utils, devenv, ... }@inputs:
+  outputs = { self, nixpkgs, flake-utils, ... }@inputs:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
       in {
-        devShells.default = devenv.lib.mkShell {
-          inherit inputs system;
-
-          modules = [
-            ({ pkgs, ... }: {
-              packages = with pkgs; [
-                git
-                gh
-                nodejs_20
-              ];
-            })
+       devShells.default = pkgs.mkShell {
+          packages = with pkgs; [
+            git
+            gh
+            nodejs_20
           ];
         };
       });
