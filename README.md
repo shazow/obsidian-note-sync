@@ -1,11 +1,11 @@
 # Obsidian Note Sync
 
-Sync a single note with a GitHub issue using the `gh` CLI. If a note has a `sync` property pointing at an issue URL, the plugin adds **Pull** and **Push** actions so you can keep the note and issue body aligned. Issue metadata is written to note properties; the `sync` property remains local-only.
+Sync a single note with a GitHub issue using the GitHub API. If a note has a `sync` property pointing at an issue URL, the plugin adds **Pull** and **Push** actions so you can keep the note and issue body aligned. Issue metadata is written to note properties; the `sync` property remains local-only.
 
 ## Requirements
 
-- Obsidian desktop (the plugin runs `gh` on your machine).
-- [`gh` CLI](https://cli.github.com/) installed and authenticated for the target repository.
+- GitHub auth token with permission to read/write the target issue (store it in plugin settings).
+- Optional: [`gh` CLI](https://cli.github.com/) to import the token automatically on desktop.
 
 ## Usage
 
@@ -15,9 +15,10 @@ Sync a single note with a GitHub issue using the `gh` CLI. If a note has a `sync
    sync: https://github.com/owner/repo/issues/123
    ---
    ```
-2. Open the note. **Pull issue** and **Push issue** buttons appear in the note header (also available via the command palette).
-3. **Pull issue** replaces the note body with the issue body and writes issue metadata into properties (title, state, number, labels, assignees, milestone, repository, updated, issue_url). The `sync` value is preserved.
-4. **Push issue** sends the note body back to the linked issue.
+2. In plugin settings, set **GitHub auth token** (or use **Fetch from gh** if available).
+3. Open the note. **Pull issue** and **Push issue** buttons appear in the note header (also in the command palette).
+4. **Pull issue** replaces the note body with the issue body and writes issue metadata into properties (title, state, number, labels, assignees, milestone, repository, updated, issue_url). The `sync` value is preserved.
+5. **Push issue** sends the note body back to the linked issue.
 
 ## Development
 

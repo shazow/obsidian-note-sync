@@ -1,21 +1,21 @@
-import {App, MarkdownView, Notice, Plugin, TFile, parseYaml, stringifyYaml} from "obsidian";
-import {execFile} from "node:child_process";
-import {promisify} from "node:util";
-import {mkdtemp, rm, writeFile} from "node:fs/promises";
-import os from "node:os";
-import {join} from "node:path";
+import {App, MarkdownView, Notice, Plugin, TFile, parseYaml, requestUrl, stringifyYaml} from "obsidian";
+import {DEFAULT_SETTINGS, NoteSyncSettingTab, NoteSyncSettings} from "./settings";
+
+interface IssueRef {
+	owner: string;
+	repo: string;
+	number: number;
+}
 
 interface IssueData {
 	title?: string;
 	body?: string;
-	number?: number;
 	state?: string;
-	labels?: {name?: string}[];
-	assignees?: {login?: string}[];
-	milestone?: {title?: string} | null;
-	repository?: {nameWithOwner?: string};
-	url?: string;
-	updatedAt?: string;
+	labels?: { name?: string }[];
+	assignees?: { login?: string }[];
+	milestone?: { title?: string } | null;
+	html_url?: string;
+	updated_at?: string;
 }
 
 interface NoteParts {
@@ -23,12 +23,15 @@ interface NoteParts {
 	body: string;
 }
 
-const execFileAsync = promisify(execFile);
-
 export default class NoteSyncPlugin extends Plugin {
+	settings: NoteSyncSettings;
 	private headerActions: HTMLElement[] = [];
 
 	async onload() {
+		this.settings = await this.loadSettings();
+
+		this.addSettingTab(new NoteSyncSettingTab(this.app, this));
+
 		this.registerEvent(this.app.workspace.on("file-open", (file) => {
 			this.refreshActions(file ?? this.app.workspace.getActiveFile());
 		}));
@@ -40,43 +43,53 @@ export default class NoteSyncPlugin extends Plugin {
 			}
 		}));
 
-			this.addCommand({
-				id: "note-sync-pull",
-				name: "Pull sync source",
-				checkCallback: (checking) => {
-					const file = this.app.workspace.getActiveFile();
-					const syncUrl = file ? getSyncUrl(this.app, file) : null;
-					if (!syncUrl || !file) {
-						return false;
-					}
-					if (!checking) {
-						void this.pullIssue(file, syncUrl);
-					}
-					return true;
-				},
-			});
+		this.addCommand({
+			id: "note-sync-pull",
+			name: "Pull sync source",
+			checkCallback: (checking) => {
+				const file = this.app.workspace.getActiveFile();
+				const syncUrl = file ? getSyncUrl(this.app, file) : null;
+				if (!syncUrl || !file) {
+					return false;
+				}
+				if (!checking) {
+					void this.pullIssue(file, syncUrl);
+				}
+				return true;
+			},
+		});
 
-			this.addCommand({
-				id: "note-sync-push",
-				name: "Push to sync source",
-				checkCallback: (checking) => {
-					const file = this.app.workspace.getActiveFile();
-					const syncUrl = file ? getSyncUrl(this.app, file) : null;
-					if (!syncUrl || !file) {
-						return false;
-					}
-					if (!checking) {
-						void this.pushIssue(file, syncUrl);
-					}
-					return true;
-				},
-			});
+		this.addCommand({
+			id: "note-sync-push",
+			name: "Push to sync source",
+			checkCallback: (checking) => {
+				const file = this.app.workspace.getActiveFile();
+				const syncUrl = file ? getSyncUrl(this.app, file) : null;
+				if (!syncUrl || !file) {
+					return false;
+				}
+				if (!checking) {
+					void this.pushIssue(file, syncUrl);
+				}
+				return true;
+			},
+		});
 
 		this.refreshActions(this.app.workspace.getActiveFile());
 	}
 
 	onunload() {
 		this.clearActions();
+	}
+
+	private async loadSettings(): Promise<NoteSyncSettings> {
+		const data: unknown = await this.loadData();
+		const persisted = (isRecord(data) ? data : {}) as Partial<NoteSyncSettings>;
+		return Object.assign({}, DEFAULT_SETTINGS, persisted);
+	}
+
+	async saveSettings() {
+		await this.saveData(this.settings);
 	}
 
 	private clearActions() {
@@ -104,9 +117,15 @@ export default class NoteSyncPlugin extends Plugin {
 	}
 
 	private async pullIssue(file: TFile, syncUrl: string) {
+		const ref = parseIssueUrl(syncUrl);
+		if (!ref) {
+			new Notice("Invalid sync URL.");
+			return;
+		}
+
 		try {
-			const issue = await fetchIssue(syncUrl);
-			await writeIssueToNote(this.app, file, syncUrl, issue);
+			const issue = await fetchIssue(ref, this.settings.githubToken);
+			await writeIssueToNote(this.app, file, syncUrl, ref, issue);
 			new Notice("Pulled issue into note.");
 			this.refreshActions(file);
 		} catch (error) {
@@ -115,12 +134,53 @@ export default class NoteSyncPlugin extends Plugin {
 	}
 
 	private async pushIssue(file: TFile, syncUrl: string) {
+		if (!this.settings.githubToken) {
+			new Notice("Set GitHub auth token in settings to push.");
+			return;
+		}
+
+		const ref = parseIssueUrl(syncUrl);
+		if (!ref) {
+			new Notice("Invalid sync URL.");
+			return;
+		}
+
 		try {
 			const {body} = await readNoteParts(this.app, file);
-			await pushIssueBody(syncUrl, body);
+			await pushIssueBody(ref, body, this.settings.githubToken);
 			new Notice("Pushed note to issue.");
 		} catch (error) {
 			notifyError("push issue", error);
+		}
+	}
+
+	async isGhAvailable(): Promise<boolean> {
+		try {
+			/* eslint-disable import/no-nodejs-modules */
+			const {execFile} = await import("node:child_process");
+			const {promisify} = await import("node:util");
+			/* eslint-enable import/no-nodejs-modules */
+			const execFileAsync = promisify(execFile);
+			await execFileAsync("gh", ["--version"]);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	async fetchTokenFromGh(): Promise<string | null> {
+		try {
+			/* eslint-disable import/no-nodejs-modules */
+			const {execFile} = await import("node:child_process");
+			const {promisify} = await import("node:util");
+			/* eslint-enable import/no-nodejs-modules */
+			const execFileAsync = promisify(execFile);
+			const {stdout} = await execFileAsync("gh", ["auth", "token"], {encoding: "utf8"});
+			const token = stdout.trim();
+			return token || null;
+		} catch (error) {
+			console.error("Note Sync: gh token fetch failed", error);
+			return null;
 		}
 	}
 }
@@ -138,35 +198,63 @@ function getSyncUrl(app: App, file: TFile): string | null {
 	return trimmed;
 }
 
-async function fetchIssue(syncUrl: string): Promise<IssueData> {
-	const fields = [
-		"title",
-		"body",
-		"number",
-		"state",
-		"labels",
-		"assignees",
-		"milestone",
-		"repository",
-		"url",
-		"updatedAt",
-	];
-	const stdout = await runGh(["issue", "view", syncUrl, "--json", fields.join(",")]);
-	return JSON.parse(stdout) as IssueData;
-}
-
-async function pushIssueBody(syncUrl: string, body: string) {
-	const tempDir = await mkdtemp(join(os.tmpdir(), "obsidian-note-sync-"));
-	const bodyPath = join(tempDir, "body.md");
-	try {
-		await writeFile(bodyPath, body, "utf8");
-		await runGh(["issue", "edit", syncUrl, "--body-file", bodyPath]);
-	} finally {
-		await rm(tempDir, {recursive: true, force: true});
+function parseIssueUrl(url: string): IssueRef | null {
+	const match = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/i.exec(url.trim());
+	if (!match) {
+		return null;
 	}
+
+	const owner = match[1] as string;
+	const repo = match[2] as string;
+	const issueNumber = match[3] as string;
+	return {
+		owner,
+		repo,
+		number: Number(issueNumber),
+	};
 }
 
-async function writeIssueToNote(app: App, file: TFile, syncUrl: string, issue: IssueData) {
+async function fetchIssue(ref: IssueRef, token: string): Promise<IssueData> {
+	const url = issueApiUrl(ref);
+	const response = await githubRequest<IssueData>(url, "GET", token);
+	return response;
+}
+
+async function pushIssueBody(ref: IssueRef, body: string, token: string) {
+	const url = issueApiUrl(ref);
+	await githubRequest<unknown>(url, "PATCH", token, {body});
+}
+
+async function githubRequest<T>(url: string, method: "GET" | "PATCH", token: string, payload?: unknown): Promise<T> {
+	const headers: Record<string, string> = {
+		Accept: "application/vnd.github+json",
+	};
+	if (token) {
+		headers.Authorization = `Bearer ${token}`;
+	}
+
+	const response = await requestUrl({
+		url,
+		method,
+		body: payload ? JSON.stringify(payload) : undefined,
+		headers,
+		contentType: payload ? "application/json" : undefined,
+		throw: false,
+	});
+
+	if (response.status >= 400) {
+		const message = extractErrorMessage(response);
+		throw new Error(message);
+	}
+
+	return response.json as T;
+}
+
+function issueApiUrl(ref: IssueRef): string {
+	return `https://api.github.com/repos/${ref.owner}/${ref.repo}/issues/${ref.number}`;
+}
+
+async function writeIssueToNote(app: App, file: TFile, syncUrl: string, ref: IssueRef, issue: IssueData) {
 	const parts = await readNoteParts(app, file);
 	const cleanedFrontmatter: Record<string, unknown> = {};
 	for (const [key, value] of Object.entries(parts.frontmatter)) {
@@ -182,26 +270,26 @@ async function writeIssueToNote(app: App, file: TFile, syncUrl: string, issue: I
 
 	cleanedFrontmatter.sync = cleanedFrontmatter.sync ?? syncUrl;
 
-	const nextFrontmatter = {
+	const nextFrontmatter: Record<string, unknown> = {
 		...cleanedFrontmatter,
 		title: issue.title,
 		state: issue.state,
-		issue: issue.number,
-		repository: issue.repository?.nameWithOwner,
-		issue_url: issue.url ?? syncUrl,
-		updated: issue.updatedAt,
+		issue: ref.number,
+		repository: `${ref.owner}/${ref.repo}`,
+		issue_url: issue.html_url ?? syncUrl,
+		updated: issue.updated_at,
 		labels: (issue.labels ?? []).map((label) => label.name).filter((label): label is string => Boolean(label)),
 		assignees: (issue.assignees ?? []).map((assignee) => assignee.login).filter((login): login is string => Boolean(login)),
 		milestone: issue.milestone?.title,
 	};
 
 	for (const key of Object.keys(nextFrontmatter)) {
-		const value = (nextFrontmatter as Record<string, unknown>)[key];
+		const value = nextFrontmatter[key];
 		if (value === undefined || value === null) {
-			delete (nextFrontmatter as Record<string, unknown>)[key];
+			delete nextFrontmatter[key];
 		}
 		if (Array.isArray(value) && value.length === 0) {
-			delete (nextFrontmatter as Record<string, unknown>)[key];
+			delete nextFrontmatter[key];
 		}
 	}
 
@@ -228,25 +316,24 @@ function buildNoteContent(frontmatter: Record<string, unknown>, body: string): s
 	return `---\n${yaml}\n---\n\n${normalizedBody}`;
 }
 
-async function runGh(args: string[]): Promise<string> {
-	try {
-		const {stdout} = await execFileAsync("gh", args, {encoding: "utf8"});
-		return stdout.trim();
-	} catch (error: unknown) {
-		const stderr = typeof error === "object" && error && "stderr" in error
-			? String((error as {stderr?: string}).stderr ?? "").trim()
-			: "";
-		const message = typeof error === "object" && error && "message" in error
-			? String((error as {message?: string}).message ?? "")
-			: "";
-		throw new Error(stderr || message || "gh command failed");
-	}
-}
-
 function notifyError(action: string, error: unknown) {
 	console.error(`Note Sync: failed to ${action}`, error);
 	const message = error instanceof Error ? error.message : String(error);
 	new Notice(`Note Sync: Failed to ${action}. ${message}`);
+}
+
+function extractErrorMessage(response: { status: number; text?: string; json?: unknown }): string {
+	const fallback = `GitHub API error (${response.status})`;
+	if (!response.text) {
+		return fallback;
+	}
+
+	try {
+		const parsed = JSON.parse(response.text) as { message?: string };
+		return parsed.message || fallback;
+	} catch {
+		return response.text || fallback;
+	}
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
