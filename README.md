@@ -16,7 +16,7 @@ Sync a single note with a GitHub issue using the GitHub API. If a note has a `sy
    ---
    ```
 2. In plugin settings, set **GitHub auth token** (or use **Fetch from gh** if available).
-3. Open the note. **Pull issue** and **Push issue** buttons appear in the note header (also in the command palette).
+3. Open the note. **Pull issue** and **Push issue** buttons appear in the note header; the command palette will also show **Sync note pull** and **Sync note push** when the note has a `sync` property.
 4. **Pull issue** replaces the note body with the issue body and writes issue metadata into properties (title, state, number, labels, assignees, milestone, repository, updated, issue_url). The `sync` value is preserved.
 5. **Push issue** sends the note body back to the linked issue.
 
