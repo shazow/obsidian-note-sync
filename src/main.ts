@@ -45,14 +45,19 @@ export default class NoteSyncPlugin extends Plugin {
 
 		this.addCommand({
 			id: "note-sync-pull",
-			name: "Pull sync source",
+			name: "Sync note pull",
 			checkCallback: (checking) => {
 				const file = this.app.workspace.getActiveFile();
-				const syncUrl = file ? getSyncUrl(this.app, file) : null;
-				if (!syncUrl || !file) {
+				const syncValue = file ? getSyncValue(this.app, file) : null;
+				if (!syncValue || !file) {
 					return false;
 				}
 				if (!checking) {
+					const syncUrl = getSyncUrl(this.app, file);
+					if (!syncUrl) {
+						new Notice("Invalid sync URL.");
+						return true;
+					}
 					void this.pullIssue(file, syncUrl);
 				}
 				return true;
@@ -61,14 +66,19 @@ export default class NoteSyncPlugin extends Plugin {
 
 		this.addCommand({
 			id: "note-sync-push",
-			name: "Push to sync source",
+			name: "Sync note push",
 			checkCallback: (checking) => {
 				const file = this.app.workspace.getActiveFile();
-				const syncUrl = file ? getSyncUrl(this.app, file) : null;
-				if (!syncUrl || !file) {
+				const syncValue = file ? getSyncValue(this.app, file) : null;
+				if (!syncValue || !file) {
 					return false;
 				}
 				if (!checking) {
+					const syncUrl = getSyncUrl(this.app, file);
+					if (!syncUrl) {
+						new Notice("Invalid sync URL.");
+						return true;
+					}
 					void this.pushIssue(file, syncUrl);
 				}
 				return true;
@@ -186,15 +196,23 @@ export default class NoteSyncPlugin extends Plugin {
 }
 
 function getSyncUrl(app: App, file: TFile): string | null {
+	const syncValue = getSyncValue(app, file);
+	if (!syncValue) {
+		return null;
+	}
+	if (!syncValue.startsWith("https://github.com/") || !syncValue.includes("/issues/")) {
+		return null;
+	}
+	return syncValue;
+}
+
+function getSyncValue(app: App, file: TFile): string | null {
 	const cache = app.metadataCache.getFileCache(file);
 	const raw = isRecord(cache?.frontmatter) ? cache?.frontmatter?.sync : undefined;
 	if (typeof raw !== "string") {
 		return null;
 	}
 	const trimmed = raw.trim();
-	if (!trimmed.startsWith("https://github.com/") || !trimmed.includes("/issues/")) {
-		return null;
-	}
 	return trimmed;
 }
 
