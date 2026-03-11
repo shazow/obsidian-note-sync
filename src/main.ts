@@ -1,99 +1,341 @@
-import {App, Editor, MarkdownView, Modal, Notice, Plugin} from 'obsidian';
-import {DEFAULT_SETTINGS, MyPluginSettings, SampleSettingTab} from "./settings";
+import {App, MarkdownView, Notice, Plugin, TFile, parseYaml, requestUrl, stringifyYaml} from "obsidian";
+import {DEFAULT_SETTINGS, NoteSyncSettingTab, NoteSyncSettings} from "./settings";
 
-// Remember to rename these classes and interfaces!
+interface IssueRef {
+	owner: string;
+	repo: string;
+	number: number;
+}
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+interface IssueData {
+	title?: string;
+	body?: string;
+	state?: string;
+	labels?: { name?: string }[];
+	assignees?: { login?: string }[];
+	milestone?: { title?: string } | null;
+	html_url?: string;
+	updated_at?: string;
+}
+
+interface NoteParts {
+	frontmatter: Record<string, unknown>;
+	body: string;
+}
+
+export default class NoteSyncPlugin extends Plugin {
+	settings: NoteSyncSettings;
+	private headerActions: HTMLElement[] = [];
 
 	async onload() {
-		await this.loadSettings();
+		this.settings = await this.loadSettings();
 
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
+		this.addSettingTab(new NoteSyncSettingTab(this.app, this));
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
+		this.registerEvent(this.app.workspace.on("file-open", (file) => {
+			this.refreshActions(file ?? this.app.workspace.getActiveFile());
+		}));
 
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
+		this.registerEvent(this.app.metadataCache.on("changed", (file) => {
+			const active = this.app.workspace.getActiveFile();
+			if (active && file?.path === active.path) {
+				this.refreshActions(active);
 			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				editor.replaceSelection('Sample editor command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
+		}));
 
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
+		this.addCommand({
+			id: "note-sync-pull",
+			name: "Pull sync source",
+			checkCallback: (checking) => {
+				const file = this.app.workspace.getActiveFile();
+				const syncUrl = file ? getSyncUrl(this.app, file) : null;
+				if (!syncUrl || !file) {
+					return false;
 				}
-				return false;
-			}
+				if (!checking) {
+					void this.pullIssue(file, syncUrl);
+				}
+				return true;
+			},
 		});
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			new Notice("Click");
+		this.addCommand({
+			id: "note-sync-push",
+			name: "Push to sync source",
+			checkCallback: (checking) => {
+				const file = this.app.workspace.getActiveFile();
+				const syncUrl = file ? getSyncUrl(this.app, file) : null;
+				if (!syncUrl || !file) {
+					return false;
+				}
+				if (!checking) {
+					void this.pushIssue(file, syncUrl);
+				}
+				return true;
+			},
 		});
 
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-
+		this.refreshActions(this.app.workspace.getActiveFile());
 	}
 
 	onunload() {
+		this.clearActions();
 	}
 
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<MyPluginSettings>);
+	private async loadSettings(): Promise<NoteSyncSettings> {
+		const data: unknown = await this.loadData();
+		const persisted = (isRecord(data) ? data : {}) as Partial<NoteSyncSettings>;
+		return Object.assign({}, DEFAULT_SETTINGS, persisted);
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
+
+	private clearActions() {
+		this.headerActions.forEach((el) => el.remove());
+		this.headerActions = [];
+	}
+
+	private refreshActions(file?: TFile | null) {
+		this.clearActions();
+		const targetFile = file ?? this.app.workspace.getActiveFile();
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!targetFile || !view || !view.file || view.file.path !== targetFile.path) {
+			return;
+		}
+
+		const syncUrl = getSyncUrl(this.app, targetFile);
+		if (!syncUrl) {
+			return;
+		}
+
+		this.headerActions.push(
+			view.addAction("download-cloud", "Pull issue", () => this.pullIssue(targetFile, syncUrl)),
+			view.addAction("upload-cloud", "Push issue", () => this.pushIssue(targetFile, syncUrl)),
+		);
+	}
+
+	private async pullIssue(file: TFile, syncUrl: string) {
+		const ref = parseIssueUrl(syncUrl);
+		if (!ref) {
+			new Notice("Invalid sync URL.");
+			return;
+		}
+
+		try {
+			const issue = await fetchIssue(ref, this.settings.githubToken);
+			await writeIssueToNote(this.app, file, syncUrl, ref, issue);
+			new Notice("Pulled issue into note.");
+			this.refreshActions(file);
+		} catch (error) {
+			notifyError("pull issue", error);
+		}
+	}
+
+	private async pushIssue(file: TFile, syncUrl: string) {
+		if (!this.settings.githubToken) {
+			new Notice("Set GitHub auth token in settings to push.");
+			return;
+		}
+
+		const ref = parseIssueUrl(syncUrl);
+		if (!ref) {
+			new Notice("Invalid sync URL.");
+			return;
+		}
+
+		try {
+			const {body} = await readNoteParts(this.app, file);
+			await pushIssueBody(ref, body, this.settings.githubToken);
+			new Notice("Pushed note to issue.");
+		} catch (error) {
+			notifyError("push issue", error);
+		}
+	}
+
+	async isGhAvailable(): Promise<boolean> {
+		try {
+			/* eslint-disable import/no-nodejs-modules */
+			const {execFile} = await import("node:child_process");
+			const {promisify} = await import("node:util");
+			/* eslint-enable import/no-nodejs-modules */
+			const execFileAsync = promisify(execFile);
+			await execFileAsync("gh", ["--version"]);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	async fetchTokenFromGh(): Promise<string | null> {
+		try {
+			/* eslint-disable import/no-nodejs-modules */
+			const {execFile} = await import("node:child_process");
+			const {promisify} = await import("node:util");
+			/* eslint-enable import/no-nodejs-modules */
+			const execFileAsync = promisify(execFile);
+			const {stdout} = await execFileAsync("gh", ["auth", "token"], {encoding: "utf8"});
+			const token = stdout.trim();
+			return token || null;
+		} catch (error) {
+			console.error("Note Sync: gh token fetch failed", error);
+			return null;
+		}
+	}
 }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
+function getSyncUrl(app: App, file: TFile): string | null {
+	const cache = app.metadataCache.getFileCache(file);
+	const raw = isRecord(cache?.frontmatter) ? cache?.frontmatter?.sync : undefined;
+	if (typeof raw !== "string") {
+		return null;
+	}
+	const trimmed = raw.trim();
+	if (!trimmed.startsWith("https://github.com/") || !trimmed.includes("/issues/")) {
+		return null;
+	}
+	return trimmed;
+}
+
+function parseIssueUrl(url: string): IssueRef | null {
+	const match = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/i.exec(url.trim());
+	if (!match) {
+		return null;
 	}
 
-	onOpen() {
-		let {contentEl} = this;
-		contentEl.setText('Woah!');
+	const owner = match[1] as string;
+	const repo = match[2] as string;
+	const issueNumber = match[3] as string;
+	return {
+		owner,
+		repo,
+		number: Number(issueNumber),
+	};
+}
+
+async function fetchIssue(ref: IssueRef, token: string): Promise<IssueData> {
+	const url = issueApiUrl(ref);
+	const response = await githubRequest<IssueData>(url, "GET", token);
+	return response;
+}
+
+async function pushIssueBody(ref: IssueRef, body: string, token: string) {
+	const url = issueApiUrl(ref);
+	await githubRequest<unknown>(url, "PATCH", token, {body});
+}
+
+async function githubRequest<T>(url: string, method: "GET" | "PATCH", token: string, payload?: unknown): Promise<T> {
+	const headers: Record<string, string> = {
+		Accept: "application/vnd.github+json",
+	};
+	if (token) {
+		headers.Authorization = `Bearer ${token}`;
 	}
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
+	const response = await requestUrl({
+		url,
+		method,
+		body: payload ? JSON.stringify(payload) : undefined,
+		headers,
+		contentType: payload ? "application/json" : undefined,
+		throw: false,
+	});
+
+	if (response.status >= 400) {
+		const message = extractErrorMessage(response);
+		throw new Error(message);
 	}
+
+	return response.json as T;
+}
+
+function issueApiUrl(ref: IssueRef): string {
+	return `https://api.github.com/repos/${ref.owner}/${ref.repo}/issues/${ref.number}`;
+}
+
+async function writeIssueToNote(app: App, file: TFile, syncUrl: string, ref: IssueRef, issue: IssueData) {
+	const parts = await readNoteParts(app, file);
+	const cleanedFrontmatter: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(parts.frontmatter)) {
+		if (key === "position") {
+			continue;
+		}
+		if (key === "sync") {
+			cleanedFrontmatter.sync = value;
+			continue;
+		}
+		cleanedFrontmatter[key] = value;
+	}
+
+	cleanedFrontmatter.sync = cleanedFrontmatter.sync ?? syncUrl;
+
+	const nextFrontmatter: Record<string, unknown> = {
+		...cleanedFrontmatter,
+		title: issue.title,
+		state: issue.state,
+		issue: ref.number,
+		repository: `${ref.owner}/${ref.repo}`,
+		issue_url: issue.html_url ?? syncUrl,
+		updated: issue.updated_at,
+		labels: (issue.labels ?? []).map((label) => label.name).filter((label): label is string => Boolean(label)),
+		assignees: (issue.assignees ?? []).map((assignee) => assignee.login).filter((login): login is string => Boolean(login)),
+		milestone: issue.milestone?.title,
+	};
+
+	for (const key of Object.keys(nextFrontmatter)) {
+		const value = nextFrontmatter[key];
+		if (value === undefined || value === null) {
+			delete nextFrontmatter[key];
+		}
+		if (Array.isArray(value) && value.length === 0) {
+			delete nextFrontmatter[key];
+		}
+	}
+
+	const content = buildNoteContent(nextFrontmatter, issue.body ?? "");
+	await app.vault.modify(file, content);
+}
+
+async function readNoteParts(app: App, file: TFile): Promise<NoteParts> {
+	const content = await app.vault.read(file);
+	const match = /^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/m.exec(content);
+	if (!match) {
+		return {frontmatter: {}, body: content};
+	}
+
+	const [, frontmatterBlock = "", body = ""] = match;
+	const parsedFrontmatter = parseYaml(frontmatterBlock) as unknown;
+	const frontmatter = isRecord(parsedFrontmatter) ? parsedFrontmatter : {};
+	return {frontmatter, body};
+}
+
+function buildNoteContent(frontmatter: Record<string, unknown>, body: string): string {
+	const yaml = stringifyYaml(frontmatter).trimEnd();
+	const normalizedBody = body.replace(/\s+$/, "") + "\n";
+	return `---\n${yaml}\n---\n\n${normalizedBody}`;
+}
+
+function notifyError(action: string, error: unknown) {
+	console.error(`Note Sync: failed to ${action}`, error);
+	const message = error instanceof Error ? error.message : String(error);
+	new Notice(`Note Sync: Failed to ${action}. ${message}`);
+}
+
+function extractErrorMessage(response: { status: number; text?: string; json?: unknown }): string {
+	const fallback = `GitHub API error (${response.status})`;
+	if (!response.text) {
+		return fallback;
+	}
+
+	try {
+		const parsed = JSON.parse(response.text) as { message?: string };
+		return parsed.message || fallback;
+	} catch {
+		return response.text || fallback;
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
