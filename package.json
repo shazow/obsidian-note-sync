@@ -1,7 +1,7 @@
 {
-	"name": "obsidian-sample-plugin",
+	"name": "obsidian-note-sync",
 	"version": "1.0.0",
-	"description": "This is a sample plugin for Obsidian (https://obsidian.md)",
+	"description": "Sync a note with a GitHub issue using the gh CLI.",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
